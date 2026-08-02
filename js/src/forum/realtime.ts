@@ -1,0 +1,588 @@
+import app from "flarum/forum/app";
+
+import chatState from "./state/chat";
+import { playNotificationSound } from "./utils/sound";
+import type Message from "../common/models/Message";
+import { NotificationLevel } from "../common/models/Channel";
+
+/**
+ * Wire event names. Must match Ramon\Chat\Realtime\BroadcastListener.
+ */
+const EVENT_MESSAGE = "ramonChat.message";
+const EVENT_MESSAGE_CHANGED = "ramonChat.messageChanged";
+const EVENT_REACTION = "ramonChat.reaction";
+const EVENT_THREAD = "ramonChat.thread";
+const EVENT_CHANNEL = "ramonChat.channel";
+const EVENT_TYPING = "ramonChat.typing";
+
+interface UploadPayload {
+  id: number;
+  fileName: string;
+  mimeType: string | null;
+  size: number;
+  width: number | null;
+  height: number | null;
+  url: string;
+  isImage: boolean;
+  createdAt: string | null;
+}
+
+interface MessagePayload {
+  id: number;
+  channelId: number;
+  threadId: number | null;
+  replyToId: number | null;
+  number: number | null;
+  userId: number | null;
+  type: string;
+  systemKey: string | null;
+  /** Placeholders the system string interpolates. See BroadcastListener. */
+  systemData?: Record<string, unknown> | null;
+  /** The author, inlined so a recipient who has never seen them can still draw the row. */
+  user?: {
+    id: number;
+    username: string;
+    displayName: string;
+    avatarUrl: string | null;
+    slug: string;
+  } | null;
+  contentHtml: string | null;
+  createdAt: string | null;
+  editedAt: string | null;
+  isDeleted: boolean;
+  isPinned?: boolean;
+  pinnedAt?: string | null;
+  uploads?: UploadPayload[];
+  /** Who the message is addressed to. Drives the highlight and the sound. */
+  mentionedUsers?: number[];
+  mentionsChannelWide?: boolean;
+}
+
+/**
+ * Binds chat events on the actor's private websocket channel.
+ *
+ * Chat is delivered per-user rather than on the shared `public` channel — see
+ * Ramon\Chat\Realtime\ChatBroadcaster for why that is a privacy boundary. The
+ * client therefore only ever binds to the user channel.
+ *
+ * Returns false when flarum/realtime is unavailable, so the caller can fall back
+ * to polling.
+ */
+let bound = false;
+
+/**
+ * Binds the handlers to a Pusher channel. Idempotent.
+ */
+function bindTo(channel: any): void {
+  if (bound || !channel?.bind) return;
+
+  channel.bind(EVENT_MESSAGE, (data: MessagePayload) => onMessage(data));
+  channel.bind(EVENT_MESSAGE_CHANGED, (data: MessagePayload) =>
+    onMessageChanged(data),
+  );
+  channel.bind(EVENT_REACTION, (data: any) => onReaction(data));
+  channel.bind(EVENT_THREAD, (data: any) => onThread(data));
+  channel.bind(EVENT_CHANNEL, (data: any) => onChannel(data));
+  channel.bind(EVENT_TYPING, (data: any) => onTyping(data));
+
+  bound = true;
+}
+
+/**
+ * Returns the user's private channel, subscribing if realtime has not already.
+ *
+ * Reads `app.websocket_channels.user` — the channel realtime stores on the app
+ * instance — rather than going through `flarum.reg`. Registry lookups are the
+ * fragile path: a module registered via `addChunkModule` resolves to `undefined`
+ * until its chunk executes, and a silent `undefined` here means the handlers are
+ * never bound and every message arrives via the polling fallback instead. Plain
+ * instance properties have no such failure mode.
+ *
+ * `subscribe()` is safe to call again: Pusher returns the existing subscription
+ * for a channel name it already holds.
+ */
+function userChannel(): any | null {
+  const ws = (app as any).websocket;
+  const channels = (app as any).websocket_channels;
+
+  if (channels?.user) return channels.user;
+
+  const id = app.session.user?.id();
+
+  if (!ws?.subscribe || !id) return null;
+
+  const channel = ws.subscribe("private-user=" + id);
+
+  if (channels) channels.user = channel;
+
+  return channel;
+}
+
+/**
+ * Binds chat events on the actor's private websocket channel.
+ *
+ * Chat is delivered per-user rather than on the shared `public` channel — see
+ * Ramon\Chat\Realtime\ChatBroadcaster for why that is a privacy boundary.
+ *
+ * Returns whether binding succeeded. It retries briefly because realtime creates
+ * `app.websocket` inside its own `mount` extension, and extension load order is
+ * not guaranteed — without the retry, being a few milliseconds early would
+ * permanently downgrade the client to polling.
+ */
+export function bindRealtime(): boolean {
+  if (!("flarum-realtime" in (flarum.extensions ?? {}))) return false;
+
+  bindTo(userChannel());
+
+  if (bound) return true;
+
+  // Realtime has not set up its client yet. Retry on a short schedule; the window
+  // is generous because the cost of giving up is a 15× slower chat.
+  let attempts = 0;
+
+  const timer = window.setInterval(() => {
+    attempts++;
+
+    try {
+      bindTo(userChannel());
+    } catch {
+      // Keep trying — a transient failure during startup is not terminal.
+    }
+
+    if (bound || attempts >= 40) {
+      window.clearInterval(timer);
+
+      if (!bound) {
+        console.warn(
+          "[ramon-chat] websocket unavailable; falling back to polling",
+        );
+        startPollingFallback();
+      }
+    }
+  }, 100);
+
+  // Reported as bound: the retry either succeeds or starts polling itself, and
+  // returning false here would start a second poller.
+  return true;
+}
+
+/** Set by index.tsx so the retry can start polling without a circular import. */
+let startPollingFallback: () => void = () => {};
+
+export function setPollingFallback(fn: () => void): void {
+  startPollingFallback = fn;
+}
+
+/** Whether the websocket handlers are live, for diagnostics. */
+export function realtimeBound(): boolean {
+  return bound;
+}
+
+/**
+ * Pushes an incoming message into the store and the channel's stream.
+ *
+ * The payload is a compact projection rather than a JSON:API document, so it is
+ * translated into the store's shape here. Relationships are attached by id only
+ * when the referenced user is already known; a missing author renders as an
+ * unnamed row rather than triggering a fetch per message.
+ */
+function onMessage(data: MessagePayload): void {
+  const message = pushMessage(data);
+
+  if (!message) return;
+
+  chatState.upsertMessage(message);
+  bumpChannel(data);
+  bumpThread(data);
+  announce(data, message);
+
+  m.redraw();
+}
+
+/**
+ * Sounds the notification for an incoming message.
+ *
+ * Skipped when the message's channel is the one on screen and the tab has focus:
+ * you watched it arrive, so a chime adds nothing. Skipped for a muted channel for
+ * the same reason the badge is.
+ *
+ * And skipped according to the channel's notification level, which is the fix for
+ * a chat that beeped continuously. Every membership already carries that setting
+ * — Never, Mentions or Always — and it defaults to Mentions, but the sound
+ * consulted only `isMuted()`. So a channel the user had explicitly set to
+ * "mentions only" still chimed on every message that arrived in it, and a member
+ * of a dozen busy channels heard a chime for traffic they had asked not to be
+ * told about. The badge honoured the setting; the sound did not.
+ *
+ * Own messages never reach here — ChatBroadcaster excludes the actor from its own
+ * broadcast.
+ */
+function announce(data: MessagePayload, message: Message): void {
+  const channel = chatState.channel(data.channelId);
+
+  if (channel?.isMuted()) return;
+
+  const watching =
+    chatState.activeChannelId === data.channelId &&
+    !chatState.drawerCollapsed &&
+    document.visibilityState === "visible" &&
+    document.hasFocus();
+
+  if (watching) return;
+
+  // Absent means the channel is not in the sidebar yet; treat it the way the
+  // default membership does rather than as "tell me everything".
+  const level = channel?.notificationLevel() ?? NotificationLevel.Mentions;
+
+  if (level === NotificationLevel.Never) return;
+
+  if (level === NotificationLevel.Mentions) {
+    // A direct message is addressed to you by construction — there is nobody
+    // else in the room to have meant it for.
+    const direct = channel?.isDirect() ?? false;
+
+    if (!direct && !message.mentionsActor()) return;
+  }
+
+  playNotificationSound();
+}
+
+/**
+ * Advances a thread's reply count when one of its replies arrives.
+ *
+ * The server increments the authoritative counter, but only broadcasts a thread
+ * event when a thread is *created*. Without this the indicator under the root
+ * message would keep showing a stale count until the next fetch.
+ */
+function bumpThread(data: MessagePayload): void {
+  if (!data.threadId) return;
+
+  const thread = app.store.getById("chat-threads", String(data.threadId));
+
+  if (!thread) return;
+
+  // Not counted for the root itself, which is the thread, not a reply to it.
+  if (thread.attribute<number | null>("originalMessageId") === data.id) return;
+
+  thread.pushAttributes({
+    repliesCount: Number(thread.attribute<number>("repliesCount") ?? 0) + 1,
+    lastMessageId: data.id,
+  });
+}
+
+function onMessageChanged(data: MessagePayload): void {
+  const existing = app.store.getById("chat-messages", String(data.id)) as
+    Message | undefined;
+
+  // Only reconcile messages already on this client. A change to something never
+  // loaded is not worth materialising.
+  if (!existing) return;
+
+  existing.pushAttributes({
+    contentHtml: data.contentHtml,
+    editedAt: data.editedAt,
+    isDeleted: data.isDeleted,
+    isEdited: Boolean(data.editedAt),
+    // Carried on the same event as edits and deletions: a pin changes what
+    // everyone in the channel sees first, so it has to land without a refresh.
+    isPinned: Boolean(data.isPinned),
+    pinnedAt: data.pinnedAt ?? null,
+    ...(data.isDeleted ? { content: null } : {}),
+  });
+
+  m.redraw();
+}
+
+function onReaction(data: {
+  messageId: number;
+  emoji: string;
+  userId: number;
+  added: boolean;
+}): void {
+  const message = app.store.getById("chat-messages", String(data.messageId)) as
+    Message | undefined;
+
+  if (!message) return;
+
+  const summary = { ...(message.reactionSummary() ?? {}) };
+  const entry = summary[data.emoji] ?? { count: 0, reacted: false };
+
+  const isActor = Number(app.session.user?.id()) === data.userId;
+
+  summary[data.emoji] = {
+    count: Math.max(0, entry.count + (data.added ? 1 : -1)),
+    // Never let someone else's reaction flip our own "reacted" flag.
+    reacted: isActor ? data.added : entry.reacted,
+  };
+
+  if (summary[data.emoji].count === 0) delete summary[data.emoji];
+
+  message.pushAttributes({ reactionSummary: summary });
+  m.redraw();
+}
+
+function onThread(data: {
+  threadId: number;
+  channelId: number;
+  repliesCount: number;
+  title: string | null;
+}): void {
+  const thread = app.store.getById("chat-threads", String(data.threadId));
+
+  if (thread) {
+    thread.pushAttributes({
+      repliesCount: data.repliesCount,
+      title: data.title,
+    });
+    m.redraw();
+  }
+}
+
+interface ChannelPayload {
+  channelId: number;
+  status: string;
+  postPermission?: string;
+  isPrivate?: boolean;
+  threadingEnabled?: boolean;
+  name?: string | null;
+  emoji?: string | null;
+  description?: string | null;
+}
+
+/** Channels with a capability refetch already in flight. */
+const refetching = new Set<number>();
+
+function onChannel(data: ChannelPayload): void {
+  const channel = chatState.channel(data.channelId);
+
+  if (!channel) return;
+
+  const before = channel.postPermission();
+
+  channel.pushAttributes({
+    status: data.status,
+    ...(data.postPermission !== undefined
+      ? { postPermission: data.postPermission }
+      : {}),
+    ...(data.isPrivate !== undefined ? { isPrivate: data.isPrivate } : {}),
+    ...(data.threadingEnabled !== undefined
+      ? { threadingEnabled: data.threadingEnabled }
+      : {}),
+    ...(data.name !== undefined ? { name: data.name } : {}),
+    ...(data.emoji !== undefined ? { emoji: data.emoji } : {}),
+    ...(data.description !== undefined
+      ? { description: data.description }
+      : {}),
+  });
+
+  // `canPostMessage` is decided per user, so it cannot ride on a broadcast — a
+  // moderator and a member get different answers from the same change. Refetch
+  // this client's own record and let the server say. Only when the rule actually
+  // moved, so an ordinary rename does not cost every member a request.
+  if (data.postPermission !== undefined && data.postPermission !== before) {
+    refreshCapabilities(data.channelId);
+  }
+
+  m.redraw();
+}
+
+/**
+ * Re-reads one channel to pick up the actor's own capability flags.
+ *
+ * Guarded against overlapping calls: a burst of edits would otherwise queue a
+ * request per event, and they would land out of order.
+ */
+function refreshCapabilities(channelId: number): void {
+  if (refetching.has(channelId)) return;
+
+  refetching.add(channelId);
+
+  app.store
+    .find("chat-channels", String(channelId))
+    .catch(() => {
+      // The channel may have become invisible to us — a private channel we were
+      // removed from. Leaving the stale record is better than throwing; the next
+      // channel list refresh drops it.
+    })
+    .then(() => {
+      refetching.delete(channelId);
+      m.redraw();
+    });
+}
+
+function onTyping(data: {
+  channelId: number;
+  userId: number;
+  username: string;
+  typing: boolean;
+  expiresIn: number;
+}): void {
+  chatState.noteTyping(
+    data.channelId,
+    data.userId,
+    data.username,
+    data.typing,
+    data.expiresIn,
+  );
+  m.redraw();
+}
+
+/**
+ * Translates the compact wire payload into a store record.
+ *
+ * Attachments are pushed as `included` records with a to-many `uploads`
+ * relationship — the same shape the Create endpoint's `defaultInclude` returns.
+ * Without them the sender saw their own image (their view came from the API
+ * response) while every recipient rendered the message with nothing in it.
+ */
+function pushMessage(data: MessagePayload): Message | null {
+  const uploads = Array.isArray(data.uploads) ? data.uploads : [];
+
+  // The author goes in `included` beside the uploads, so the `user` relationship
+  // below resolves to a record instead of a dangling reference. Without it, a
+  // recipient who has never seen this person renders the row as "[deleted]" —
+  // which is what happens on a fresh page for every author but yourself.
+  const author = data.user
+    ? [
+        {
+          type: "users",
+          id: String(data.user.id),
+          attributes: {
+            username: data.user.username,
+            displayName: data.user.displayName,
+            avatarUrl: data.user.avatarUrl,
+            slug: data.user.slug,
+          },
+        },
+      ]
+    : [];
+
+  try {
+    return app.store.pushPayload<Message>({
+      included: [
+        ...author,
+        ...uploads.map((upload) => ({
+          type: "chat-uploads",
+          id: String(upload.id),
+          attributes: {
+            fileName: upload.fileName,
+            mimeType: upload.mimeType,
+            size: upload.size,
+            width: upload.width,
+            height: upload.height,
+            url: upload.url,
+            isImage: upload.isImage,
+            createdAt: upload.createdAt,
+            // Not null: `isPending()` treats a null messageId as an attachment
+            // still sitting in someone's composer, which would render it as a
+            // draft chip instead of a sent image.
+            messageId: data.id,
+          },
+          relationships: data.userId
+            ? { user: { data: { type: "users", id: String(data.userId) } } }
+            : {},
+        })),
+      ],
+      data: {
+        type: "chat-messages",
+        id: String(data.id),
+        attributes: {
+          channelId: data.channelId,
+          threadId: data.threadId,
+          replyToId: data.replyToId,
+          number: data.number,
+          type: data.type,
+          systemKey: data.systemKey,
+          systemData: data.systemData ?? null,
+          contentHtml: data.contentHtml,
+          createdAt: data.createdAt,
+          editedAt: data.editedAt,
+          isDeleted: data.isDeleted,
+          isEdited: Boolean(data.editedAt),
+          isPinned: Boolean(data.isPinned),
+          pinnedAt: data.pinnedAt ?? null,
+          reactionSummary: {},
+          // Read from the payload rather than blanked. Hardcoding these meant a
+          // message arriving live was never recognised as a mention: it drew
+          // without the highlight, and the sound had no way to tell an @you from
+          // ordinary chatter.
+          mentionedUsers: Array.isArray(data.mentionedUsers)
+            ? data.mentionedUsers
+            : [],
+          mentionsChannelWide: Boolean(data.mentionsChannelWide),
+          isBookmarked: false,
+          // Capability flags default closed: the push payload cannot know them,
+          // and offering an action the server would refuse is worse than
+          // withholding it until the row is re-fetched.
+          canEdit: false,
+          canDelete: false,
+          canReact: true,
+          canReply: true,
+          canCreateThread: false,
+          canMove: false,
+          canPin: false,
+        },
+        relationships: {
+          ...(data.userId
+            ? { user: { data: { type: "users", id: String(data.userId) } } }
+            : {}),
+          // Always sent, even empty: `hasMany` returns false for an absent
+          // relationship, and the message row cannot distinguish "no
+          // attachments" from "not loaded yet" without it.
+          uploads: {
+            data: uploads.map((upload) => ({
+              type: "chat-uploads",
+              id: String(upload.id),
+            })),
+          },
+        },
+      },
+    } as any);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Advances the channel's last-message pointer and its unread badge.
+ *
+ * The badge is incremented locally rather than re-fetched: the server has already
+ * done the authoritative increment, and a request per incoming message would
+ * defeat the point of using a websocket.
+ */
+function bumpChannel(data: MessagePayload): void {
+  const channel = chatState.channel(data.channelId);
+
+  // The channel is not in the loaded list — usually because the chat has never
+  // been opened this session. The per-channel badge has nothing to attach to, but
+  // the header count and the nav dot read the actor's own counters, and those
+  // still have to move or the user is never told anything arrived.
+  if (!channel) {
+    chatState.bumpUnreadCounters(1, 0, true);
+
+    return;
+  }
+
+  const attrs: Record<string, unknown> = {
+    lastMessageId: data.id,
+    lastMessageAt: data.createdAt,
+  };
+
+  const isActive =
+    chatState.activeChannelId === data.channelId && !chatState.drawerCollapsed;
+
+  if (isActive) {
+    // Reading it now — tell the server, do not badge.
+    chatState.markRead(data.channelId);
+  } else if (!channel.isMuted()) {
+    const before = channel.unreadCount() ?? 0;
+
+    attrs.unreadCount = before + 1;
+
+    // `newChannel` only when this channel went from nothing-unread to something:
+    // the channel counter counts channels, not messages.
+    chatState.bumpUnreadCounters(1, 0, before === 0);
+  }
+
+  channel.pushAttributes(attrs);
+}
